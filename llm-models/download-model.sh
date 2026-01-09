@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+URL="https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-f16.gguf"
+OUT="SmolLM2-135M-Instruct-f16.gguf"
+
+if command -v curl >/dev/null 2>&1; then
+  curl -L -o "${OUT}" "${URL}"
+elif command -v wget >/dev/null 2>&1; then
+  wget -O "${OUT}" "${URL}"
+else
+  echo "error: need curl or wget to download the model" >&2
+  exit 1
+fi
