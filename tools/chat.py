@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL = ROOT / "llm-models" / "SmolLM2-135M-Instruct-f16.gguf"
+DEFAULT_MODEL = ROOT / "llm-models" / "SmolLM2-135M-Instruct-Q8_0.gguf"
 DEFAULT_WEIGHTS = ROOT / "llm-models" / "weights_full"
 PROMPT_MEM = ROOT / "tb" / "prompt_ids.mem"
 
@@ -48,7 +48,7 @@ def tokenize(model_path, text):
     return ast.literal_eval(out)
 
 
-def run_verilator(run_script, weights_dir, ids):
+def run_verilator(run_script, weights_dir, ids, use_fp16):
     PROMPT_MEM.parent.mkdir(parents=True, exist_ok=True)
     with PROMPT_MEM.open("w", encoding="ascii") as f:
         for tid in ids:
@@ -59,6 +59,8 @@ def run_verilator(run_script, weights_dir, ids):
         f"+prompt_ids={PROMPT_MEM}",
         f"+prompt_len={len(ids)}",
     ]
+    if use_fp16:
+        cmd.append("+use_fp16=1")
     out = run(cmd)
     for line in out.splitlines():
         if line.startswith("NEXT_TOKEN_ID="):
@@ -140,10 +142,10 @@ def run_llama_next_token(model_path, prompt_text):
     return token_text
 
 
-def run_generation(model_path, run_script, weights_dir, ids, steps, vocab, compare_cpu, prompt_text):
+def run_generation(model_path, run_script, weights_dir, ids, steps, vocab, compare_cpu, prompt_text, use_fp16):
     out_text = []
     for _ in range(steps):
-        next_id = run_verilator(run_script, weights_dir, ids)
+        next_id = run_verilator(run_script, weights_dir, ids, use_fp16)
         ids.append(next_id)
         token_text = decode_tokens([next_id], vocab)
         if token_text == "" and vocab is None:
@@ -167,6 +169,7 @@ def main():
     parser.add_argument("--steps", type=int, default=16, help="Tokens to generate per prompt")
     parser.add_argument("--prompt", default=None, help="Prompt text (single-shot mode)")
     parser.add_argument("--compare-cpu", action="store_true", help="Print HDL vs CPU tokens per step")
+    parser.add_argument("--use-fp16", action="store_true", help="Use FP16 mems and SV path")
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -203,6 +206,7 @@ def main():
             vocab,
             args.compare_cpu,
             prompt_text,
+            args.use_fp16,
         )
         if not args.compare_cpu:
             print(output, end="")
@@ -226,6 +230,7 @@ def main():
             vocab,
             args.compare_cpu,
             prompt_text,
+            args.use_fp16,
         )
         if not args.compare_cpu:
             print(output, end="", flush=True)

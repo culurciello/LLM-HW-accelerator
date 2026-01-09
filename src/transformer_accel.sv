@@ -10,7 +10,8 @@ module transformer_accel #(
     parameter int MAX_SEQ = 2,
     parameter int D_MODEL = 4,
     parameter int D_FF = 8,
-    parameter int MATMUL_LANES = 1
+    parameter int MATMUL_LANES = 1,
+    parameter bit USE_FP16 = 0
   )(
     input  logic clk,
     input  logic rst_n,
@@ -99,6 +100,7 @@ module transformer_accel #(
   matmul #(
       .DATA_W(DATA_W), .FRAC_W(FRAC_W), .ACC_W(ACC_W),
       .LANES(MATMUL_LANES),
+      .USE_FP16(USE_FP16),
       .A_DEPTH(INPUT_DEPTH), .B_DEPTH(WQ_DEPTH), .C_DEPTH(Q_DEPTH)
     ) mm_q (
       .clk(clk), .rst_n(rst_n), .start(mm_q_start), .b_transpose(1'b0),
@@ -111,6 +113,7 @@ module transformer_accel #(
   matmul #(
       .DATA_W(DATA_W), .FRAC_W(FRAC_W), .ACC_W(ACC_W),
       .LANES(MATMUL_LANES),
+      .USE_FP16(USE_FP16),
       .A_DEPTH(INPUT_DEPTH), .B_DEPTH(WK_DEPTH), .C_DEPTH(K_DEPTH)
     ) mm_k (
       .clk(clk), .rst_n(rst_n), .start(mm_k_start), .b_transpose(1'b0),
@@ -123,6 +126,7 @@ module transformer_accel #(
   matmul #(
       .DATA_W(DATA_W), .FRAC_W(FRAC_W), .ACC_W(ACC_W),
       .LANES(MATMUL_LANES),
+      .USE_FP16(USE_FP16),
       .A_DEPTH(INPUT_DEPTH), .B_DEPTH(WV_DEPTH), .C_DEPTH(V_DEPTH)
     ) mm_v (
       .clk(clk), .rst_n(rst_n), .start(mm_v_start), .b_transpose(1'b0),
@@ -135,6 +139,7 @@ module transformer_accel #(
   matmul #(
       .DATA_W(DATA_W), .FRAC_W(FRAC_W), .ACC_W(ACC_W),
       .LANES(MATMUL_LANES),
+      .USE_FP16(USE_FP16),
       .A_DEPTH(Q_DEPTH), .B_DEPTH(K_DEPTH), .C_DEPTH(SCORE_DEPTH)
     ) mm_scores (
       .clk(clk), .rst_n(rst_n), .start(mm_scores_start), .b_transpose(1'b1),
@@ -158,6 +163,7 @@ module transformer_accel #(
   matmul #(
       .DATA_W(DATA_W), .FRAC_W(FRAC_W), .ACC_W(ACC_W),
       .LANES(MATMUL_LANES),
+      .USE_FP16(USE_FP16),
       .A_DEPTH(PROB_DEPTH), .B_DEPTH(V_DEPTH), .C_DEPTH(CONTEXT_DEPTH)
     ) mm_context (
       .clk(clk), .rst_n(rst_n), .start(mm_context_start), .b_transpose(1'b0),
@@ -170,6 +176,7 @@ module transformer_accel #(
   matmul #(
       .DATA_W(DATA_W), .FRAC_W(FRAC_W), .ACC_W(ACC_W),
       .LANES(MATMUL_LANES),
+      .USE_FP16(USE_FP16),
       .A_DEPTH(CONTEXT_DEPTH), .B_DEPTH(WO_DEPTH), .C_DEPTH(PROJ_DEPTH)
     ) mm_proj (
       .clk(clk), .rst_n(rst_n), .start(mm_proj_start), .b_transpose(1'b0),
@@ -182,6 +189,7 @@ module transformer_accel #(
   matmul #(
       .DATA_W(DATA_W), .FRAC_W(FRAC_W), .ACC_W(ACC_W),
       .LANES(MATMUL_LANES),
+      .USE_FP16(USE_FP16),
       .A_DEPTH(RES1_DEPTH), .B_DEPTH(W1_DEPTH), .C_DEPTH(HIDDEN_DEPTH)
     ) mm_mlp1 (
       .clk(clk), .rst_n(rst_n), .start(mm_mlp1_start), .b_transpose(1'b0),
@@ -194,6 +202,7 @@ module transformer_accel #(
   matmul #(
       .DATA_W(DATA_W), .FRAC_W(FRAC_W), .ACC_W(ACC_W),
       .LANES(MATMUL_LANES),
+      .USE_FP16(USE_FP16),
       .A_DEPTH(ACT_DEPTH), .B_DEPTH(W2_DEPTH), .C_DEPTH(OUT_DEPTH)
     ) mm_mlp2 (
       .clk(clk), .rst_n(rst_n), .start(mm_mlp2_start), .b_transpose(1'b0),

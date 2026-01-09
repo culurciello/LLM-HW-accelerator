@@ -9,8 +9,8 @@ package transformer_pkg;
   function automatic logic signed [DATA_W-1:0] sat_q(
       input logic signed [ACC_W-1:0] v
   );
-    logic signed [DATA_W-1:0] max_v;
-    logic signed [DATA_W-1:0] min_v;
+    logic signed [ACC_W-1:0] max_v;
+    logic signed [ACC_W-1:0] min_v;
     begin
       max_v = {1'b0, {(DATA_W-1){1'b1}}};
       min_v = {1'b1, {(DATA_W-1){1'b0}}};
@@ -42,7 +42,7 @@ package transformer_pkg;
   );
     logic signed [ACC_W-1:0] sum;
     begin
-      sum = a + b;
+      sum = $signed(a) + $signed(b);
       add_q = sat_q(sum);
     end
   endfunction
@@ -91,8 +91,8 @@ package transformer_pkg;
     begin
       half_q = (1 <<< (FRAC_W-1));
       one_q = (1 <<< FRAC_W);
-      a_q = $rtoi(0.797885 * (1 << FRAC_W));
-      b_q = $rtoi(0.044715 * (1 << FRAC_W));
+      a_q = $signed($rtoi(0.797885 * (1 << FRAC_W)));
+      b_q = $signed($rtoi(0.044715 * (1 << FRAC_W)));
 
       x2 = mul_q(x, x);
       x3 = mul_q(x2, x);
@@ -121,9 +121,125 @@ package transformer_pkg;
       if (den == 0)
         div_q = 0;
       else begin
-        numerator = num;
-        quotient = (numerator <<< FRAC_W) / den;
+        numerator = $signed(num);
+        quotient = (numerator <<< FRAC_W) / $signed(den);
         div_q = sat_q(quotient);
+      end
+    end
+  endfunction
+
+  function automatic logic [15:0] fp16_mul(
+      input logic [15:0] a,
+      input logic [15:0] b
+  );
+    logic sign;
+    logic [4:0] exp_a;
+    logic [4:0] exp_b;
+    logic [5:0] exp_sum;
+    logic [10:0] man_a;
+    logic [10:0] man_b;
+    logic [21:0] man_prod;
+    logic [4:0] exp_out;
+    logic [9:0] man_out;
+    begin
+      if (a[14:0] == 0 || b[14:0] == 0) begin
+        fp16_mul = 16'h0000;
+      end else if (a[14:10] == 5'h1F || b[14:10] == 5'h1F) begin
+        fp16_mul = {a[15] ^ b[15], 5'h1F, 10'h000};
+      end else begin
+        sign = a[15] ^ b[15];
+        exp_a = a[14:10];
+        exp_b = b[14:10];
+        man_a = {1'b1, a[9:0]};
+        man_b = {1'b1, b[9:0]};
+        man_prod = man_a * man_b;
+        exp_sum = exp_a + exp_b - 5'd15;
+        if (man_prod[21]) begin
+          man_out = man_prod[20:11];
+          exp_sum = exp_sum + 1;
+        end else begin
+          man_out = man_prod[19:10];
+        end
+        if ($signed(exp_sum) <= 0) begin
+          fp16_mul = 16'h0000;
+        end else if (exp_sum >= 31) begin
+          fp16_mul = {sign, 5'h1F, 10'h000};
+        end else begin
+          exp_out = exp_sum[4:0];
+          fp16_mul = {sign, exp_out, man_out};
+        end
+      end
+    end
+  endfunction
+
+  function automatic logic [15:0] fp16_add(
+      input logic [15:0] a,
+      input logic [15:0] b
+  );
+    logic sign_a;
+    logic sign_b;
+    logic [4:0] exp_a;
+    logic [4:0] exp_b;
+    logic [10:0] man_a;
+    logic [10:0] man_b;
+    logic [11:0] man_sum;
+    logic [4:0] exp_out;
+    logic sign_out;
+    integer shift;
+    begin
+      if (a[14:0] == 0)
+        fp16_add = b;
+      else if (b[14:0] == 0)
+        fp16_add = a;
+      else if (a[14:10] == 5'h1F)
+        fp16_add = a;
+      else if (b[14:10] == 5'h1F)
+        fp16_add = b;
+      else begin
+        sign_a = a[15];
+        sign_b = b[15];
+        exp_a = a[14:10];
+        exp_b = b[14:10];
+        man_a = {1'b1, a[9:0]};
+        man_b = {1'b1, b[9:0]};
+        if (exp_a > exp_b) begin
+          shift = exp_a - exp_b;
+          man_b = (shift >= 11) ? 11'h0 : (man_b >> shift);
+          exp_out = exp_a;
+        end else begin
+          shift = exp_b - exp_a;
+          man_a = (shift >= 11) ? 11'h0 : (man_a >> shift);
+          exp_out = exp_b;
+        end
+        if (sign_a == sign_b) begin
+          man_sum = man_a + man_b;
+          sign_out = sign_a;
+        end else if (man_a >= man_b) begin
+          man_sum = man_a - man_b;
+          sign_out = sign_a;
+        end else begin
+          man_sum = man_b - man_a;
+          sign_out = sign_b;
+        end
+        if (man_sum == 0) begin
+          fp16_add = 16'h0000;
+        end else begin
+          if (man_sum[11]) begin
+            man_sum = man_sum >> 1;
+            exp_out = exp_out + 1;
+          end else begin
+            while (man_sum[10] == 0 && exp_out > 0) begin
+              man_sum = man_sum << 1;
+              exp_out = exp_out - 1;
+            end
+          end
+          if (exp_out == 0)
+            fp16_add = 16'h0000;
+          else if (exp_out >= 31)
+            fp16_add = {sign_out, 5'h1F, 10'h000};
+          else
+            fp16_add = {sign_out, exp_out, man_sum[9:0]};
+        end
       end
     end
   endfunction

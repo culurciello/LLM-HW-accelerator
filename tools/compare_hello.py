@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL_F16 = ROOT / "llm-models" / "SmolLM2-135M-Instruct-f16.gguf"
+DEFAULT_MODEL_F16 = ROOT / "llm-models" / "SmolLM2-135M-Instruct-Q8_0.gguf"
 DEFAULT_WEIGHTS_DIR = ROOT / "llm-models" / "weights_full"
 DEFAULT_PROMPT_FILE = ROOT / "tb" / "prompt_ids.mem"
 DEFAULT_PROMPT = "hello"
@@ -68,7 +68,7 @@ def eos_token_id(model_f16):
     return int(reader.fields["tokenizer.ggml.eos_token_id"].contents())
 
 
-def run_verilator(run_script, weights_dir, prompt_file, prompt_len, dump_topk=False):
+def run_verilator(run_script, weights_dir, prompt_file, prompt_len, dump_topk=False, use_fp16=False):
     print(f"[compare] run verilator: {run_script}")
     cmd = [
         str(run_script),
@@ -76,6 +76,8 @@ def run_verilator(run_script, weights_dir, prompt_file, prompt_len, dump_topk=Fa
         f"+prompt_ids={prompt_file}",
         f"+prompt_len={prompt_len}",
     ]
+    if use_fp16:
+        cmd.append("+use_fp16=1")
     if dump_topk:
         cmd.append("+dump_topk=1")
     out = run(cmd)
@@ -99,11 +101,42 @@ def _tensor_map(reader):
 
 
 def _tensor_data(tensor):
+    ttype = getattr(tensor, "tensor_type", None)
+    if ttype == 8:
+        return _dequant_q8_0(tensor)
     arr = np.array(tensor.data, dtype=np.float32)
     shape = list(getattr(tensor, "shape", []))
     if shape:
         arr = arr.reshape(shape)
     return arr
+
+
+def _dequant_q8_0(tensor):
+    data = np.asarray(tensor.data)
+    if data.dtype != np.uint8:
+        data = data.astype(np.uint8)
+    if data.ndim != 2:
+        raise RuntimeError("Q8_0 tensor data expected 2D byte array")
+    rows, row_bytes = data.shape
+    block_bytes = 34
+    if row_bytes % block_bytes != 0:
+        raise RuntimeError(f"Q8_0 row bytes {row_bytes} not divisible by {block_bytes}")
+    n_blocks = row_bytes // block_bytes
+    out = np.empty((rows, n_blocks * 32), dtype=np.float32)
+    for r in range(rows):
+        row = data[r].reshape(n_blocks, block_bytes)
+        scales = row[:, :2].copy().view("<f2").reshape(n_blocks).astype(np.float32)
+        qs = row[:, 2:].view(np.int8).astype(np.float32)
+        out[r] = (qs * scales[:, None]).reshape(-1)
+    shape = list(getattr(tensor, "shape", []))
+    if shape:
+        if out.shape == tuple(shape):
+            return out
+        if out.T.shape == tuple(shape):
+            return out.T
+        if out.size == int(np.prod(shape)):
+            return out.reshape(shape)
+    return out
 
 
 def _field_u32(reader, key, default=None):
@@ -432,6 +465,7 @@ def main():
     parser.add_argument("--weights-dir", default=str(DEFAULT_WEIGHTS_DIR))
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--prompt-file", default=str(DEFAULT_PROMPT_FILE))
+    parser.add_argument("--use-fp16", action="store_true", help="Use FP16 mems and SV path")
     args = parser.parse_args()
 
     model_f16 = Path(args.model_f16)
@@ -461,6 +495,7 @@ def main():
             prompt_file,
             len(ids),
             dump_topk=True,
+            use_fp16=args.use_fp16,
         )
     else:
         print("[compare] architecture: gpt2")
@@ -471,6 +506,7 @@ def main():
             prompt_file,
             len(ids),
             dump_topk=True,
+            use_fp16=args.use_fp16,
         )
     llama_token, llama_text = run_llama_cli(model_f16, prompt)
 

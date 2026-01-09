@@ -49,7 +49,7 @@ def tokenize(model_path, text):
     return ast.literal_eval(out)
 
 
-def run_verilator(weights_dir, ids):
+def run_verilator(weights_dir, ids, use_fp16):
     PROMPT_MEM.parent.mkdir(parents=True, exist_ok=True)
     with PROMPT_MEM.open("w", encoding="ascii") as f:
         for tid in ids:
@@ -61,6 +61,8 @@ def run_verilator(weights_dir, ids):
         f"+prompt_len={len(ids)}",
         "+dump_topk=1",
     ]
+    if use_fp16:
+        cmd.append("+use_fp16=1")
     out = run(cmd)
     topk = []
     next_id = None
@@ -140,11 +142,42 @@ def _tensor_map(reader):
 
 
 def _tensor_data(tensor):
+    ttype = getattr(tensor, "tensor_type", None)
+    if ttype == 8:
+        return _dequant_q8_0(tensor)
     arr = np.array(tensor.data, dtype=np.float32)
     shape = list(getattr(tensor, "shape", []))
     if shape:
         arr = arr.reshape(shape)
     return arr
+
+
+def _dequant_q8_0(tensor):
+    data = np.asarray(tensor.data)
+    if data.dtype != np.uint8:
+        data = data.astype(np.uint8)
+    if data.ndim != 2:
+        raise RuntimeError("Q8_0 tensor data expected 2D byte array")
+    rows, row_bytes = data.shape
+    block_bytes = 34
+    if row_bytes % block_bytes != 0:
+        raise RuntimeError(f"Q8_0 row bytes {row_bytes} not divisible by {block_bytes}")
+    n_blocks = row_bytes // block_bytes
+    out = np.empty((rows, n_blocks * 32), dtype=np.float32)
+    for r in range(rows):
+        row = data[r].reshape(n_blocks, block_bytes)
+        scales = row[:, :2].copy().view("<f2").reshape(n_blocks).astype(np.float32)
+        qs = row[:, 2:].view(np.int8).astype(np.float32)
+        out[r] = (qs * scales[:, None]).reshape(-1)
+    shape = list(getattr(tensor, "shape", []))
+    if shape:
+        if out.shape == tuple(shape):
+            return out
+        if out.T.shape == tuple(shape):
+            return out.T
+        if out.size == int(np.prod(shape)):
+            return out.reshape(shape)
+    return out
 
 
 def _field_u32(reader, key, default=None):
@@ -272,6 +305,7 @@ def main():
     parser.add_argument("--weights-dir", required=True, help="Path to exported Q8.8 weights")
     parser.add_argument("--prompt", required=True, help="Prompt text")
     parser.add_argument("--frac-w", type=int, default=8, help="Fractional bits for Q format")
+    parser.add_argument("--use-fp16", action="store_true", help="Use FP16 mems and SV path")
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -284,7 +318,7 @@ def main():
     ids = tokenize(model_path, args.prompt)
     if not ids:
         raise RuntimeError("Tokenization returned no IDs")
-    sv_next, topk = run_verilator(weights_dir, ids)
+    sv_next, topk = run_verilator(weights_dir, ids, args.use_fp16)
     logits = python_logits(model_path, ids)
     llama_next_id = None
     llama_next_text = None

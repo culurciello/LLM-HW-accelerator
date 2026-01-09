@@ -5,6 +5,7 @@ module matmul #(
     parameter int FRAC_W = transformer_pkg::FRAC_W,
     parameter int ACC_W  = transformer_pkg::ACC_W,
     parameter int LANES  = 1,
+    parameter bit USE_FP16 = 0,
     parameter int A_DEPTH = 256,
     parameter int B_DEPTH = 256,
     parameter int C_DEPTH = 256
@@ -35,6 +36,8 @@ module matmul #(
   int unsigned k;
   logic signed [ACC_W-1:0] acc;
   logic signed [ACC_W-1:0] lane_sum;
+  logic [DATA_W-1:0] acc_fp16;
+  logic [DATA_W-1:0] lane_sum_fp16;
   integer lane;
 
   function automatic int unsigned b_index(
@@ -51,10 +54,16 @@ module matmul #(
 
   always_comb begin
     lane_sum = '0;
+    lane_sum_fp16 = '0;
     for (lane = 0; lane < LANES; lane = lane + 1) begin
       if (k + lane < K) begin
         lane_sum = lane_sum + (a_mem[a_base + (i * K) + (k + lane)] *
                                b_mem[b_index(k + lane, j)] >>> FRAC_W);
+        lane_sum_fp16 = fp16_add(
+          lane_sum_fp16,
+          fp16_mul(a_mem[a_base + (i * K) + (k + lane)],
+                   b_mem[b_index(k + lane, j)])
+        );
       end
     end
   end
@@ -67,6 +76,7 @@ module matmul #(
       j     <= 0;
       k     <= 0;
       acc   <= '0;
+      acc_fp16 <= '0;
     end else begin
       case (state)
         IDLE: begin
@@ -76,17 +86,24 @@ module matmul #(
             j   <= 0;
             k   <= 0;
             acc <= '0;
+            acc_fp16 <= '0;
             state <= RUN;
           end
         end
         RUN: begin
           logic signed [ACC_W-1:0] mac;
+          logic [DATA_W-1:0] mac_fp16;
 
           mac   = acc + lane_sum;
+          mac_fp16 = fp16_add(acc_fp16, lane_sum_fp16);
 
           if (k + LANES >= K) begin
-            c_mem[c_base + (i * N) + j] <= sat_q(mac);
+            if (USE_FP16)
+              c_mem[c_base + (i * N) + j] <= mac_fp16;
+            else
+              c_mem[c_base + (i * N) + j] <= sat_q(mac);
             acc <= '0;
+            acc_fp16 <= '0;
             k <= 0;
             if (j == N - 1) begin
               j <= 0;
@@ -101,6 +118,7 @@ module matmul #(
           end else begin
             k <= k + 1;
             acc <= mac;
+            acc_fp16 <= mac_fp16;
           end
         end
         DONE: begin
