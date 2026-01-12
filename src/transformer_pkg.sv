@@ -9,11 +9,16 @@ package transformer_pkg;
   function automatic logic signed [DATA_W-1:0] sat_q(
       input logic signed [ACC_W-1:0] v
   );
+    localparam int EXT_W = (ACC_W > DATA_W) ? (ACC_W - DATA_W) : 0;
     logic signed [ACC_W-1:0] max_v;
     logic signed [ACC_W-1:0] min_v;
+    logic signed [DATA_W-1:0] max_dw;
+    logic signed [DATA_W-1:0] min_dw;
     begin
-      max_v = {1'b0, {(DATA_W-1){1'b1}}};
-      min_v = {1'b1, {(DATA_W-1){1'b0}}};
+      max_dw = {1'b0, {(DATA_W-1){1'b1}}};
+      min_dw = {1'b1, {(DATA_W-1){1'b0}}};
+      max_v = $signed({{EXT_W{1'b0}}, max_dw});
+      min_v = $signed({{EXT_W{1'b1}}, min_dw});
       if (v > max_v)
         sat_q = max_v;
       else if (v < min_v)
@@ -91,8 +96,8 @@ package transformer_pkg;
     begin
       half_q = (1 <<< (FRAC_W-1));
       one_q = (1 <<< FRAC_W);
-      a_q = $signed($rtoi(0.797885 * (1 << FRAC_W)));
-      b_q = $signed($rtoi(0.044715 * (1 << FRAC_W)));
+      a_q = sat_q($signed($rtoi(0.797885 * (1 << FRAC_W))));
+      b_q = sat_q($signed($rtoi(0.044715 * (1 << FRAC_W))));
 
       x2 = mul_q(x, x);
       x3 = mul_q(x2, x);

@@ -6,7 +6,7 @@ This repository contains two complementary implementations:
 - A behavioral full-model reference (`src/transformer_full.sv`) used for GPT-2 style end-to-end testing.
 - A behavioral LLaMA/GQA model (`src/llama_full.sv`) used for SmolLM2-style testing.
 
-Both implement a GPT2-style transformer with Q8.8 fixed-point math, but the accelerator version is built around explicit matmul, softmax, and layernorm modules so it maps cleanly to FPGA resources.
+Both implement a GPT2-style transformer, but the accelerator version is built around explicit matmul, softmax, and layernorm modules so it maps cleanly to FPGA resources. The full-model path now runs in FP16 for closer alignment with the reference model.
 
 ## Top-Level Blocks
 
@@ -28,7 +28,7 @@ All intermediate tensors are stored in on-chip arrays (modeled as SV memories fo
 The matmul block is the primary compute engine:
 
 - Parameterized by M, K, N at runtime.
-- Q8.8 MAC accumulation (`DATA_W`, `FRAC_W`, `ACC_W`).
+- FP16 MAC accumulation (`DATA_W`, `ACC_W`).
 - `LANES` parameter enables multi-lane MACs to scale DSP usage.
 - `b_transpose` allows K^T access without an explicit transpose buffer.
 
@@ -44,7 +44,7 @@ Implements fixed-point layer normalization for the accelerator block. The full-m
 Behavioral, layer-by-layer full-model implementation used for end-to-end inference:
 
 - Implements all layers, embeddings, KV cache, and output projection.
-- Uses the same Q8.8 quantized weights as the accelerator.
+- Uses GGUF-exported weights from `tools/gguf_export_full.py`.
 - Runs entirely inside a single `always_ff` for Verilator simulation.
 
 This is not a high-performance microarchitecture, but it is a functional reference for testing.
@@ -73,16 +73,15 @@ The accelerator exposes a simple word-addressed map for inputs, weights, and out
 - `0x07F0`: control (`seq_len`, `done`)
 
 ### Weight Export
-`tools/gguf_export_full.py` exports GGUF weights into `.mem` files using Q8.8. These are loaded by Verilator testbenches and can be adapted for hardware integration.
+`tools/gguf_export_full.py` exports GGUF weights into FP16 `.mem` files. These are loaded by Verilator testbenches and can be adapted for hardware integration.
 
-## Fixed-Point Arithmetic
+## FP16 Arithmetic
 
-- **Format**: Q8.8 for weights and activations.
+- **Format**: FP16 for weights and activations.
 - **Accumulators**: wider (`ACC_W`) to reduce overflow.
-- **Saturation**: applied after each matmul output.
-- **Approximations**: exp/gelu approximations are used to keep logic simple.
+- **Approximations**: exp/softmax approximations are used to keep logic simple.
 
-Expect differences versus llama.cpp due to fixed-point math and approximations.
+Expect differences versus llama.cpp due to approximations and simplified control flow.
 
 ## DSP Scaling
 

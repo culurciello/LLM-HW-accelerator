@@ -32,48 +32,13 @@ def _get_tensor(reader, name):
 
 def _tensor_data(tensor):
     ttype = getattr(tensor, "tensor_type", None)
-    if ttype == 8:
-        return _dequant_q8_0(tensor)
+    if ttype not in (None, 0, 1):
+        raise RuntimeError("Quantized GGUF tensors are not supported. Use the F16 model.")
     arr = np.array(tensor.data, dtype=np.float32)
     shape = list(getattr(tensor, "shape", []))
     if shape:
         arr = arr.reshape(shape)
     return arr
-
-
-def _dequant_q8_0(tensor):
-    data = np.asarray(tensor.data)
-    if data.dtype != np.uint8:
-        data = data.astype(np.uint8)
-    if data.ndim != 2:
-        raise RuntimeError("Q8_0 tensor data expected 2D byte array")
-    rows, row_bytes = data.shape
-    block_bytes = 34
-    if row_bytes % block_bytes != 0:
-        raise RuntimeError(f"Q8_0 row bytes {row_bytes} not divisible by {block_bytes}")
-    n_blocks = row_bytes // block_bytes
-    out = np.empty((rows, n_blocks * 32), dtype=np.float32)
-    for r in range(rows):
-        row = data[r].reshape(n_blocks, block_bytes)
-        scales = row[:, :2].copy().view("<f2").reshape(n_blocks).astype(np.float32)
-        qs = row[:, 2:].view(np.int8).astype(np.float32)
-        out[r] = (qs * scales[:, None]).reshape(-1)
-    shape = list(getattr(tensor, "shape", []))
-    if shape:
-        if out.shape == tuple(shape):
-            return out
-        if out.T.shape == tuple(shape):
-            return out.T
-        if out.size == int(np.prod(shape)):
-            return out.reshape(shape)
-    return out
-
-
-def to_q8_8(arr, frac_w):
-    scale = 1 << frac_w
-    scaled = np.round(arr * scale).astype(np.int32)
-    clipped = np.clip(scaled, -32768, 32767).astype(np.int16)
-    return clipped
 
 
 def write_mem(path, arr):
@@ -89,6 +54,15 @@ def write_mem_fp16(path, arr):
             f.write(f"{int(val) & 0xFFFF:04x}\n")
 
 
+def write_mem_q8(path, arr, frac_w):
+    scale = 1 << frac_w
+    scaled = np.round(arr * scale).astype(np.int32)
+    clipped = np.clip(scaled, -32768, 32767).astype(np.int16)
+    with path.open("w", encoding="ascii") as f:
+        for val in clipped.flatten(order="C"):
+            f.write(f"{int(val) & 0xFFFF:04x}\n")
+
+
 def field_u32(reader, key):
     field = reader.fields[key]
     return int(field.contents())
@@ -99,7 +73,7 @@ def field_list(reader, key):
     return field.contents()
 
 
-def export_gpt2(reader, out_dir, frac_w, fp16):
+def export_gpt2(reader, out_dir, fixed_point=False, frac_w=8):
     n_layer = field_u32(reader, "gpt2.block_count")
     n_embd = field_u32(reader, "gpt2.embedding_length")
     n_ff = field_u32(reader, "gpt2.feed_forward_length")
@@ -119,18 +93,18 @@ def export_gpt2(reader, out_dir, frac_w, fp16):
     if out_weight.shape != (n_embd, vocab):
         raise RuntimeError(f"output.weight shape {out_weight.shape}")
 
-    if fp16:
+    if fixed_point:
+        write_mem_q8(out_dir / "token_embd.mem", token_embd.T, frac_w)
+        write_mem_q8(out_dir / "pos_embd.mem", pos_embd.T, frac_w)
+        write_mem_q8(out_dir / "output_weight.mem", out_weight.T, frac_w)
+        write_mem_q8(out_dir / "output_norm_weight.mem", out_norm_w, frac_w)
+        write_mem_q8(out_dir / "output_norm_bias.mem", out_norm_b, frac_w)
+    else:
         write_mem_fp16(out_dir / "token_embd.mem", token_embd.T)
         write_mem_fp16(out_dir / "pos_embd.mem", pos_embd.T)
         write_mem_fp16(out_dir / "output_weight.mem", out_weight.T)
         write_mem_fp16(out_dir / "output_norm_weight.mem", out_norm_w)
         write_mem_fp16(out_dir / "output_norm_bias.mem", out_norm_b)
-    else:
-        write_mem(out_dir / "token_embd.mem", to_q8_8(token_embd.T, frac_w))
-        write_mem(out_dir / "pos_embd.mem", to_q8_8(pos_embd.T, frac_w))
-        write_mem(out_dir / "output_weight.mem", to_q8_8(out_weight.T, frac_w))
-        write_mem(out_dir / "output_norm_weight.mem", to_q8_8(out_norm_w, frac_w))
-        write_mem(out_dir / "output_norm_bias.mem", to_q8_8(out_norm_b, frac_w))
 
     attn_norm_w_all = []
     attn_norm_b_all = []
@@ -182,7 +156,24 @@ def export_gpt2(reader, out_dir, frac_w, fp16):
         ffn_dn_w_all.append(ffn_dn_w)
         ffn_dn_b_all.append(ffn_dn_b)
 
-    if fp16:
+    if fixed_point:
+        write_mem_q8(out_dir / "attn_norm_weight.mem", np.stack(attn_norm_w_all, axis=0), frac_w)
+        write_mem_q8(out_dir / "attn_norm_bias.mem", np.stack(attn_norm_b_all, axis=0), frac_w)
+        write_mem_q8(out_dir / "attn_qkv_weight.mem", np.stack(qkv_w_all, axis=0), frac_w)
+        write_mem_q8(out_dir / "attn_qkv_bias.mem", np.stack(qkv_b_all, axis=0), frac_w)
+        write_mem_q8(out_dir / "attn_output_weight.mem", np.stack(attn_out_w_all, axis=0), frac_w)
+        write_mem_q8(out_dir / "attn_output_bias.mem", np.stack(attn_out_b_all, axis=0), frac_w)
+        write_mem_q8(out_dir / "ffn_norm_weight.mem", np.stack(ffn_norm_w_all, axis=0), frac_w)
+        write_mem_q8(out_dir / "ffn_norm_bias.mem", np.stack(ffn_norm_b_all, axis=0), frac_w)
+        write_mem_q8(out_dir / "ffn_up_weight.mem", np.stack(ffn_up_w_all, axis=0), frac_w)
+        write_mem_q8(out_dir / "ffn_up_bias.mem", np.stack(ffn_up_b_all, axis=0), frac_w)
+        write_mem_q8(out_dir / "ffn_down_weight.mem", np.stack(ffn_dn_w_all, axis=0), frac_w)
+        write_mem_q8(out_dir / "ffn_down_bias.mem", np.stack(ffn_dn_b_all, axis=0), frac_w)
+        print(
+            f"Exported GPT-2 {n_layer} layers, vocab {vocab}, d_model {n_embd} "
+            f"to {out_dir} (Q{16-frac_w}.{frac_w})"
+        )
+    else:
         write_mem_fp16(out_dir / "attn_norm_weight.mem", np.stack(attn_norm_w_all, axis=0))
         write_mem_fp16(out_dir / "attn_norm_bias.mem", np.stack(attn_norm_b_all, axis=0))
         write_mem_fp16(out_dir / "attn_qkv_weight.mem", np.stack(qkv_w_all, axis=0))
@@ -195,25 +186,10 @@ def export_gpt2(reader, out_dir, frac_w, fp16):
         write_mem_fp16(out_dir / "ffn_up_bias.mem", np.stack(ffn_up_b_all, axis=0))
         write_mem_fp16(out_dir / "ffn_down_weight.mem", np.stack(ffn_dn_w_all, axis=0))
         write_mem_fp16(out_dir / "ffn_down_bias.mem", np.stack(ffn_dn_b_all, axis=0))
-    else:
-        write_mem(out_dir / "attn_norm_weight.mem", to_q8_8(np.stack(attn_norm_w_all, axis=0), frac_w))
-        write_mem(out_dir / "attn_norm_bias.mem", to_q8_8(np.stack(attn_norm_b_all, axis=0), frac_w))
-        write_mem(out_dir / "attn_qkv_weight.mem", to_q8_8(np.stack(qkv_w_all, axis=0), frac_w))
-        write_mem(out_dir / "attn_qkv_bias.mem", to_q8_8(np.stack(qkv_b_all, axis=0), frac_w))
-        write_mem(out_dir / "attn_output_weight.mem", to_q8_8(np.stack(attn_out_w_all, axis=0), frac_w))
-        write_mem(out_dir / "attn_output_bias.mem", to_q8_8(np.stack(attn_out_b_all, axis=0), frac_w))
-        write_mem(out_dir / "ffn_norm_weight.mem", to_q8_8(np.stack(ffn_norm_w_all, axis=0), frac_w))
-        write_mem(out_dir / "ffn_norm_bias.mem", to_q8_8(np.stack(ffn_norm_b_all, axis=0), frac_w))
-        write_mem(out_dir / "ffn_up_weight.mem", to_q8_8(np.stack(ffn_up_w_all, axis=0), frac_w))
-        write_mem(out_dir / "ffn_up_bias.mem", to_q8_8(np.stack(ffn_up_b_all, axis=0), frac_w))
-        write_mem(out_dir / "ffn_down_weight.mem", to_q8_8(np.stack(ffn_dn_w_all, axis=0), frac_w))
-        write_mem(out_dir / "ffn_down_bias.mem", to_q8_8(np.stack(ffn_dn_b_all, axis=0), frac_w))
-
-    mode = "FP16" if fp16 else "Q8.8"
-    print(f"Exported GPT-2 {n_layer} layers, vocab {vocab}, d_model {n_embd} to {out_dir} ({mode})")
+        print(f"Exported GPT-2 {n_layer} layers, vocab {vocab}, d_model {n_embd} to {out_dir} (FP16)")
 
 
-def export_llama(reader, out_dir, frac_w, fp16):
+def export_llama(reader, out_dir):
     n_layer = field_u32(reader, "llama.block_count")
     n_embd = field_u32(reader, "llama.embedding_length")
     n_ff = field_u32(reader, "llama.feed_forward_length")
@@ -227,14 +203,9 @@ def export_llama(reader, out_dir, frac_w, fp16):
     if out_norm_w.shape != (n_embd,):
         raise RuntimeError(f"output_norm.weight shape {out_norm_w.shape}")
 
-    if fp16:
-        write_mem_fp16(out_dir / "token_embd.mem", token_embd.T)
-        write_mem_fp16(out_dir / "output_weight.mem", token_embd.T)
-        write_mem_fp16(out_dir / "output_norm_weight.mem", out_norm_w)
-    else:
-        write_mem(out_dir / "token_embd.mem", to_q8_8(token_embd.T, frac_w))
-        write_mem(out_dir / "output_weight.mem", to_q8_8(token_embd.T, frac_w))
-        write_mem(out_dir / "output_norm_weight.mem", to_q8_8(out_norm_w, frac_w))
+    write_mem_fp16(out_dir / "token_embd.mem", token_embd.T)
+    write_mem_fp16(out_dir / "output_weight.mem", token_embd.T)
+    write_mem_fp16(out_dir / "output_norm_weight.mem", out_norm_w)
 
     attn_norm_w_all = []
     ffn_norm_w_all = []
@@ -279,32 +250,20 @@ def export_llama(reader, out_dir, frac_w, fp16):
         ffn_up_w_all.append(ffn_up_w)
         ffn_dn_w_all.append(ffn_dn_w)
 
-    if fp16:
-        write_mem_fp16(out_dir / "attn_norm_weight.mem", np.stack(attn_norm_w_all, axis=0))
-        write_mem_fp16(out_dir / "ffn_norm_weight.mem", np.stack(ffn_norm_w_all, axis=0))
-        write_mem_fp16(out_dir / "attn_q_weight.mem", np.stack(attn_q_w_all, axis=0))
-        write_mem_fp16(out_dir / "attn_k_weight.mem", np.stack(attn_k_w_all, axis=0))
-        write_mem_fp16(out_dir / "attn_v_weight.mem", np.stack(attn_v_w_all, axis=0))
-        write_mem_fp16(out_dir / "attn_output_weight.mem", np.stack(attn_out_w_all, axis=0))
-        write_mem_fp16(out_dir / "ffn_gate_weight.mem", np.stack(ffn_gate_w_all, axis=0))
-        write_mem_fp16(out_dir / "ffn_up_weight.mem", np.stack(ffn_up_w_all, axis=0))
-        write_mem_fp16(out_dir / "ffn_down_weight.mem", np.stack(ffn_dn_w_all, axis=0))
-    else:
-        write_mem(out_dir / "attn_norm_weight.mem", to_q8_8(np.stack(attn_norm_w_all, axis=0), frac_w))
-        write_mem(out_dir / "ffn_norm_weight.mem", to_q8_8(np.stack(ffn_norm_w_all, axis=0), frac_w))
-        write_mem(out_dir / "attn_q_weight.mem", to_q8_8(np.stack(attn_q_w_all, axis=0), frac_w))
-        write_mem(out_dir / "attn_k_weight.mem", to_q8_8(np.stack(attn_k_w_all, axis=0), frac_w))
-        write_mem(out_dir / "attn_v_weight.mem", to_q8_8(np.stack(attn_v_w_all, axis=0), frac_w))
-        write_mem(out_dir / "attn_output_weight.mem", to_q8_8(np.stack(attn_out_w_all, axis=0), frac_w))
-        write_mem(out_dir / "ffn_gate_weight.mem", to_q8_8(np.stack(ffn_gate_w_all, axis=0), frac_w))
-        write_mem(out_dir / "ffn_up_weight.mem", to_q8_8(np.stack(ffn_up_w_all, axis=0), frac_w))
-        write_mem(out_dir / "ffn_down_weight.mem", to_q8_8(np.stack(ffn_dn_w_all, axis=0), frac_w))
+    write_mem_fp16(out_dir / "attn_norm_weight.mem", np.stack(attn_norm_w_all, axis=0))
+    write_mem_fp16(out_dir / "ffn_norm_weight.mem", np.stack(ffn_norm_w_all, axis=0))
+    write_mem_fp16(out_dir / "attn_q_weight.mem", np.stack(attn_q_w_all, axis=0))
+    write_mem_fp16(out_dir / "attn_k_weight.mem", np.stack(attn_k_w_all, axis=0))
+    write_mem_fp16(out_dir / "attn_v_weight.mem", np.stack(attn_v_w_all, axis=0))
+    write_mem_fp16(out_dir / "attn_output_weight.mem", np.stack(attn_out_w_all, axis=0))
+    write_mem_fp16(out_dir / "ffn_gate_weight.mem", np.stack(ffn_gate_w_all, axis=0))
+    write_mem_fp16(out_dir / "ffn_up_weight.mem", np.stack(ffn_up_w_all, axis=0))
+    write_mem_fp16(out_dir / "ffn_down_weight.mem", np.stack(ffn_dn_w_all, axis=0))
 
-    mode = "FP16" if fp16 else "Q8.8"
-    print(f"Exported LLaMA {n_layer} layers, vocab {vocab}, d_model {n_embd} to {out_dir} ({mode})")
+    print(f"Exported LLaMA {n_layer} layers, vocab {vocab}, d_model {n_embd} to {out_dir} (FP16)")
 
 
-def export(model_path, out_dir, frac_w, fp16):
+def export(model_path, out_dir, fixed_point=False, frac_w=8):
     reader = gguf.GGUFReader(str(model_path))
 
     arch = reader.fields.get("general.architecture")
@@ -314,9 +273,9 @@ def export(model_path, out_dir, frac_w, fp16):
 
     out_dir.mkdir(parents=True, exist_ok=True)
     if arch_name == "gpt2":
-        export_gpt2(reader, out_dir, frac_w, fp16)
+        export_gpt2(reader, out_dir, fixed_point=fixed_point, frac_w=frac_w)
     elif arch_name == "llama":
-        export_llama(reader, out_dir, frac_w, fp16)
+        export_llama(reader, out_dir)
     else:
         raise RuntimeError(
             f"Unsupported architecture '{arch_name}'. This exporter supports GPT-2 and LLaMA GGUF only."
@@ -324,15 +283,15 @@ def export(model_path, out_dir, frac_w, fp16):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export full GGUF weights to Q8.8 mem files.")
-    parser.add_argument("--model", required=True, help="Path to F16 GGUF model")
+    parser = argparse.ArgumentParser(description="Export full GGUF weights to mem files.")
+    parser.add_argument("--model", required=True, help="Path to GGUF model")
     parser.add_argument("--out", required=True, help="Output directory")
-    parser.add_argument("--frac-w", type=int, default=8)
-    parser.add_argument("--fp16", action="store_true", help="Write FP16 mem files instead of Q8.8")
+    parser.add_argument("--fixed-point", action="store_true", help="Export GPT-2 weights as fixed-point")
+    parser.add_argument("--frac-w", type=int, default=8, help="Fractional bits for fixed-point export")
     args = parser.parse_args()
 
     _require_gguf()
-    export(Path(args.model), Path(args.out), args.frac_w, args.fp16)
+    export(Path(args.model), Path(args.out), fixed_point=args.fixed_point, frac_w=args.frac_w)
 
 
 if __name__ == "__main__":

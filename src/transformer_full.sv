@@ -10,7 +10,8 @@ module transformer_full #(
     parameter int D_FF    = 256,
     parameter int MAX_CTX = 2048,
     parameter int VOCAB   = 50257,
-    parameter int MAX_PROMPT = 128
+    parameter int MAX_PROMPT = 128,
+    parameter int TOP_K = 40
   )(
     input  logic clk,
     input  logic rst_n,
@@ -58,8 +59,8 @@ module transformer_full #(
   logic signed [DATA_W-1:0] ffn_out  [0:D_MODEL-1];
   logic signed [DATA_W-1:0] scores   [0:MAX_CTX-1];
   logic signed [DATA_W-1:0] weights  [0:MAX_CTX-1];
-  logic [31:0] debug_topk_id [0:4];
-  logic signed [ACC_W-1:0] debug_topk_score [0:4];
+  logic [31:0] debug_topk_id [0:TOP_K-1];
+  logic signed [ACC_W-1:0] debug_topk_score [0:TOP_K-1];
 
   function automatic int unsigned idx2d(
       input int unsigned row,
@@ -353,14 +354,14 @@ module transformer_full #(
     integer d;
     logic signed [ACC_W-1:0] acc;
     logic signed [ACC_W-1:0] best_acc;
-    logic signed [ACC_W-1:0] top_score [0:4];
-    logic [31:0] top_id [0:4];
+    logic signed [ACC_W-1:0] top_score [0:TOP_K-1];
+    logic [31:0] top_id [0:TOP_K-1];
     integer k;
     integer insert;
     begin
       best_acc = -32'sh4000_0000;
       token_id = 0;
-      for (k = 0; k < 5; k = k + 1) begin
+      for (k = 0; k < TOP_K; k = k + 1) begin
         top_score[k] = -32'sh4000_0000;
         top_id[k] = 0;
       end
@@ -373,8 +374,8 @@ module transformer_full #(
           best_acc = acc;
           token_id = v[31:0];
         end
-        if (acc > top_score[4]) begin
-          insert = 4;
+        if (acc > top_score[TOP_K-1]) begin
+          insert = TOP_K-1;
           while (insert > 0 && acc > top_score[insert-1]) begin
             top_score[insert] = top_score[insert-1];
             top_id[insert] = top_id[insert-1];
@@ -384,7 +385,7 @@ module transformer_full #(
           top_id[insert] = v[31:0];
         end
       end
-      for (k = 0; k < 5; k = k + 1) begin
+      for (k = 0; k < TOP_K; k = k + 1) begin
         debug_topk_id[k] = top_id[k];
         debug_topk_score[k] = top_score[k];
       end

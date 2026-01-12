@@ -4,6 +4,7 @@
 
 module tb_infer;
   localparam int DATA_W = 16;
+  localparam int TOP_K = 40;
 
   logic clk;
   logic rst_n;
@@ -119,8 +120,13 @@ module tb_infer;
 
     $display("NEXT_TOKEN_ID=%0d", next_token_id);
     if ($value$plusargs("dump_topk=%d", dump_topk) && dump_topk != 0) begin
-      for (i = 0; i < 5; i = i + 1) begin
-        $display("TOPK[%0d] id=%0d score=%0d", i, dut.debug_topk_id[i], dut.debug_topk_score[i]);
+      for (i = 0; i < TOP_K; i = i + 1) begin
+        $display(
+          "TOPK[%0d] id=%0d score_q=%0d",
+          i,
+          dut.debug_topk_id[i],
+          dut.debug_topk_score[i]
+        );
       end
     end
     $finish;

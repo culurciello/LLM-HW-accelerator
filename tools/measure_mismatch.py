@@ -11,6 +11,8 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_MEM = ROOT / "tb" / "prompt_ids.mem"
+DEFAULT_MODEL = ROOT / "llm-models" / "SmolLM2-135M-Instruct-f16.gguf"
+DEFAULT_WEIGHTS = ROOT / "llm-models" / "weights_full"
 
 try:
     import gguf
@@ -49,20 +51,18 @@ def tokenize(model_path, text):
     return ast.literal_eval(out)
 
 
-def run_verilator(weights_dir, ids, use_fp16):
+def run_verilator(run_script, weights_dir, ids):
     PROMPT_MEM.parent.mkdir(parents=True, exist_ok=True)
     with PROMPT_MEM.open("w", encoding="ascii") as f:
         for tid in ids:
             f.write(f"{tid:08x}\n")
     cmd = [
-        str(ROOT / "tb" / "run_infer.sh"),
+        str(run_script),
         f"+weights_dir={weights_dir}",
         f"+prompt_ids={PROMPT_MEM}",
         f"+prompt_len={len(ids)}",
         "+dump_topk=1",
     ]
-    if use_fp16:
-        cmd.append("+use_fp16=1")
     out = run(cmd)
     topk = []
     next_id = None
@@ -143,41 +143,13 @@ def _tensor_map(reader):
 
 def _tensor_data(tensor):
     ttype = getattr(tensor, "tensor_type", None)
-    if ttype == 8:
-        return _dequant_q8_0(tensor)
+    if ttype not in (None, 0, 1):
+        raise RuntimeError("Quantized GGUF tensors are not supported. Use the F16 model.")
     arr = np.array(tensor.data, dtype=np.float32)
     shape = list(getattr(tensor, "shape", []))
     if shape:
         arr = arr.reshape(shape)
     return arr
-
-
-def _dequant_q8_0(tensor):
-    data = np.asarray(tensor.data)
-    if data.dtype != np.uint8:
-        data = data.astype(np.uint8)
-    if data.ndim != 2:
-        raise RuntimeError("Q8_0 tensor data expected 2D byte array")
-    rows, row_bytes = data.shape
-    block_bytes = 34
-    if row_bytes % block_bytes != 0:
-        raise RuntimeError(f"Q8_0 row bytes {row_bytes} not divisible by {block_bytes}")
-    n_blocks = row_bytes // block_bytes
-    out = np.empty((rows, n_blocks * 32), dtype=np.float32)
-    for r in range(rows):
-        row = data[r].reshape(n_blocks, block_bytes)
-        scales = row[:, :2].copy().view("<f2").reshape(n_blocks).astype(np.float32)
-        qs = row[:, 2:].view(np.int8).astype(np.float32)
-        out[r] = (qs * scales[:, None]).reshape(-1)
-    shape = list(getattr(tensor, "shape", []))
-    if shape:
-        if out.shape == tuple(shape):
-            return out
-        if out.T.shape == tuple(shape):
-            return out.T
-        if out.size == int(np.prod(shape)):
-            return out.reshape(shape)
-    return out
 
 
 def _field_u32(reader, key, default=None):
@@ -194,91 +166,96 @@ def _field_f32(reader, key, default=None):
     return float(field.contents())
 
 
-def _layer_norm(x, weight, bias, eps):
-    mean = x.mean(axis=-1, keepdims=True)
-    var = ((x - mean) ** 2).mean(axis=-1, keepdims=True)
-    norm = (x - mean) / np.sqrt(var + eps)
-    return norm * weight + bias
-
-
-def _gelu(x):
-    return 0.5 * x * (1.0 + np.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x**3)))
-
-
 def python_logits(model_path, prompt_ids):
     if gguf is None:
         raise RuntimeError("Missing gguf package")
     reader = gguf.GGUFReader(str(model_path))
     tensors = _tensor_map(reader)
 
-    n_layer = _field_u32(reader, "gpt2.block_count")
-    n_embd = _field_u32(reader, "gpt2.embedding_length")
-    n_ff = _field_u32(reader, "gpt2.feed_forward_length")
-    n_ctx = _field_u32(reader, "gpt2.context_length")
-    n_head = _field_u32(reader, "gpt2.attention.head_count")
-    if n_head is None:
-        n_head = _field_u32(reader, "gpt2.head_count")
-    if n_head is None:
-        raise RuntimeError("Missing head count in GGUF metadata")
-    eps = _field_f32(reader, "gpt2.attention.layer_norm_epsilon")
-    if eps is None:
-        eps = _field_f32(reader, "gpt2.layer_norm_epsilon", 1e-5)
+    arch = reader.fields.get("general.architecture")
+    arch_name = str(arch.contents()) if arch is not None else ""
+    if arch_name != "llama":
+        raise RuntimeError("measure_mismatch.py supports LLaMA models only.")
+
+    n_layer = _field_u32(reader, "llama.block_count")
+    n_embd = _field_u32(reader, "llama.embedding_length")
+    n_ff = _field_u32(reader, "llama.feed_forward_length")
+    n_ctx = _field_u32(reader, "llama.context_length")
+    n_head = _field_u32(reader, "llama.attention.head_count")
+    n_kv_head = _field_u32(reader, "llama.attention.head_count_kv")
+    rope_dim = _field_u32(reader, "llama.rope.dimension_count")
+    rope_base = _field_f32(reader, "llama.rope.freq_base", 10000.0)
+    eps = _field_f32(reader, "llama.attention.layer_norm_rms_epsilon", 1e-5)
     head_dim = n_embd // n_head
 
     token_embd = _tensor_data(tensors["token_embd.weight"])
-    pos_embd = _tensor_data(tensors["position_embd.weight"])
-    out_weight = _tensor_data(tensors["output.weight"])
     out_norm_w = _tensor_data(tensors["output_norm.weight"])
-    out_norm_b = _tensor_data(tensors["output_norm.bias"])
 
-    qkv_w = []
-    qkv_b = []
     attn_norm_w = []
-    attn_norm_b = []
-    attn_out_w = []
-    attn_out_b = []
     ffn_norm_w = []
-    ffn_norm_b = []
+    attn_q_w = []
+    attn_k_w = []
+    attn_v_w = []
+    attn_out_w = []
+    ffn_gate_w = []
     ffn_up_w = []
-    ffn_up_b = []
     ffn_dn_w = []
-    ffn_dn_b = []
     for layer in range(n_layer):
         prefix = f"blk.{layer}."
         attn_norm_w.append(_tensor_data(tensors[prefix + "attn_norm.weight"]))
-        attn_norm_b.append(_tensor_data(tensors[prefix + "attn_norm.bias"]))
-        qkv_w.append(_tensor_data(tensors[prefix + "attn_qkv.weight"]))
-        qkv_b.append(_tensor_data(tensors[prefix + "attn_qkv.bias"]))
-        attn_out_w.append(_tensor_data(tensors[prefix + "attn_output.weight"]))
-        attn_out_b.append(_tensor_data(tensors[prefix + "attn_output.bias"]))
         ffn_norm_w.append(_tensor_data(tensors[prefix + "ffn_norm.weight"]))
-        ffn_norm_b.append(_tensor_data(tensors[prefix + "ffn_norm.bias"]))
+        attn_q_w.append(_tensor_data(tensors[prefix + "attn_q.weight"]))
+        attn_k_w.append(_tensor_data(tensors[prefix + "attn_k.weight"]))
+        attn_v_w.append(_tensor_data(tensors[prefix + "attn_v.weight"]))
+        attn_out_w.append(_tensor_data(tensors[prefix + "attn_output.weight"]))
+        ffn_gate_w.append(_tensor_data(tensors[prefix + "ffn_gate.weight"]))
         ffn_up_w.append(_tensor_data(tensors[prefix + "ffn_up.weight"]))
-        ffn_up_b.append(_tensor_data(tensors[prefix + "ffn_up.bias"]))
         ffn_dn_w.append(_tensor_data(tensors[prefix + "ffn_down.weight"]))
-        ffn_dn_b.append(_tensor_data(tensors[prefix + "ffn_down.bias"]))
 
-    k_cache = np.zeros((n_layer, n_ctx, n_head, head_dim), dtype=np.float32)
-    v_cache = np.zeros((n_layer, n_ctx, n_head, head_dim), dtype=np.float32)
+    k_cache = np.zeros((n_layer, n_ctx, n_kv_head, head_dim), dtype=np.float32)
+    v_cache = np.zeros((n_layer, n_ctx, n_kv_head, head_dim), dtype=np.float32)
+
+    rope_pairs = rope_dim // 2
+    inv_freq = 1.0 / (rope_base ** (np.arange(0, rope_pairs) * 2.0 / rope_dim))
 
     for pos, tid in enumerate(prompt_ids):
-        x = token_embd[:, tid] + pos_embd[:, pos]
-        x = x.astype(np.float32)
+        x = token_embd[:, tid].astype(np.float32)
         for layer in range(n_layer):
-            ln1 = _layer_norm(x, attn_norm_w[layer], attn_norm_b[layer], eps)
-            qkv = ln1 @ qkv_w[layer] + qkv_b[layer]
-            q = qkv[:n_embd].reshape(n_head, head_dim)
-            k = qkv[n_embd : 2 * n_embd].reshape(n_head, head_dim)
-            v = qkv[2 * n_embd :].reshape(n_head, head_dim)
+            x_norm = x / np.sqrt(np.mean(x * x) + eps) * attn_norm_w[layer]
+            q = x_norm @ attn_q_w[layer]
+            k = x_norm @ attn_k_w[layer]
+            v = x_norm @ attn_v_w[layer]
+
+            q = q.reshape(n_head, head_dim)
+            k = k.reshape(n_kv_head, head_dim)
+            v = v.reshape(n_kv_head, head_dim)
+
+            angles = pos * inv_freq
+            cos = np.cos(angles)
+            sin = np.sin(angles)
+            for h in range(n_head):
+                qh = q[h]
+                q1 = qh[:rope_dim:2]
+                q2 = qh[1:rope_dim:2]
+                qh[:rope_dim:2] = q1 * cos - q2 * sin
+                qh[1:rope_dim:2] = q1 * sin + q2 * cos
+            for h in range(n_kv_head):
+                kh = k[h]
+                k1 = kh[:rope_dim:2]
+                k2 = kh[1:rope_dim:2]
+                kh[:rope_dim:2] = k1 * cos - k2 * sin
+                kh[1:rope_dim:2] = k1 * sin + k2 * cos
 
             k_cache[layer, pos] = k
             v_cache[layer, pos] = v
 
             attn_heads = np.zeros((n_head, head_dim), dtype=np.float32)
             scale = 1.0 / math.sqrt(head_dim)
+            group = n_head // n_kv_head
             for h in range(n_head):
-                k_hist = k_cache[layer, : pos + 1, h, :]
-                v_hist = v_cache[layer, : pos + 1, h, :]
+                kv_h = h // group
+                k_hist = k_cache[layer, : pos + 1, kv_h, :]
+                v_hist = v_cache[layer, : pos + 1, kv_h, :]
                 scores = (k_hist @ q[h]) * scale
                 scores = scores - scores.max()
                 weights = np.exp(scores)
@@ -286,26 +263,30 @@ def python_logits(model_path, prompt_ids):
                 attn_heads[h] = weights @ v_hist
 
             attn = attn_heads.reshape(n_embd)
-            proj = attn @ attn_out_w[layer] + attn_out_b[layer]
+            proj = attn @ attn_out_w[layer]
             x = x + proj
 
-            ln2 = _layer_norm(x, ffn_norm_w[layer], ffn_norm_b[layer], eps)
-            up = ln2 @ ffn_up_w[layer] + ffn_up_b[layer]
-            up = _gelu(up)
-            down = up @ ffn_dn_w[layer] + ffn_dn_b[layer]
+            x_norm = x / np.sqrt(np.mean(x * x) + eps) * ffn_norm_w[layer]
+            gate = x_norm @ ffn_gate_w[layer]
+            up = x_norm @ ffn_up_w[layer]
+            act = (gate / (1.0 + np.exp(-gate))) * up
+            down = act @ ffn_dn_w[layer]
             x = x + down
 
-    x = _layer_norm(x, out_norm_w, out_norm_b, eps)
-    return x @ out_weight
+    x = x / np.sqrt(np.mean(x * x) + eps) * out_norm_w
+    return token_embd.T @ x
+
+
+def fp16_bits_to_float(score):
+    score16 = score & 0xFFFF
+    return np.array([score16], dtype=np.uint16).view(np.float16).astype(np.float32)[0]
 
 
 def main():
     parser = argparse.ArgumentParser(description="Measure arithmetic mismatch between SV and float logits.")
-    parser.add_argument("--model", required=True, help="Path to F16 GGUF model")
-    parser.add_argument("--weights-dir", required=True, help="Path to exported Q8.8 weights")
+    parser.add_argument("--model", default=str(DEFAULT_MODEL), help="Path to F16 GGUF model")
+    parser.add_argument("--weights-dir", default=str(DEFAULT_WEIGHTS), help="Path to exported FP16 weights")
     parser.add_argument("--prompt", required=True, help="Prompt text")
-    parser.add_argument("--frac-w", type=int, default=8, help="Fractional bits for Q format")
-    parser.add_argument("--use-fp16", action="store_true", help="Use FP16 mems and SV path")
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -318,7 +299,9 @@ def main():
     ids = tokenize(model_path, args.prompt)
     if not ids:
         raise RuntimeError("Tokenization returned no IDs")
-    sv_next, topk = run_verilator(weights_dir, ids, args.use_fp16)
+
+    run_script = ROOT / "tb" / "run_llama_infer.sh"
+    sv_next, topk = run_verilator(run_script, weights_dir, ids)
     logits = python_logits(model_path, ids)
     llama_next_id = None
     llama_next_text = None
@@ -327,7 +310,6 @@ def main():
     except Exception as exc:
         print(f"llama.cpp error: {exc}", file=sys.stderr)
 
-    frac = 1 << args.frac_w
     errors = []
     print(f"prompt: {args.prompt}")
     print(f"prompt_ids: {ids}")
@@ -335,9 +317,9 @@ def main():
     if llama_next_id is not None:
         print(f"llama_next_token_id: {llama_next_id}")
         print(f"llama_next_token_text: {llama_next_text}")
-    print("id sv_q8_8 sv_float py_logit abs_err rel_err")
+    print("id sv_fp16 sv_float py_logit abs_err rel_err")
     for tid, score in topk:
-        sv_float = score / frac
+        sv_float = fp16_bits_to_float(score)
         py_logit = float(logits[tid])
         abs_err = abs(py_logit - sv_float)
         rel_err = abs_err / (abs(py_logit) + 1e-9)

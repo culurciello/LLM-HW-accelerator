@@ -1,8 +1,8 @@
 `timescale 1ns/1ps
 
-`include "../src/llama_full.sv"
+`include "../src/gpt2_full_fp16.sv"
 
-module tb_llama_infer;
+module tb_gpt2_infer;
   localparam int TOP_K = 40;
   logic clk;
   logic rst_n;
@@ -16,7 +16,7 @@ module tb_llama_infer;
   int unsigned prompt_len_arg;
   int unsigned dump_topk;
 
-  llama_full dut (
+  gpt2_full_fp16 dut (
     .clk(clk),
     .rst_n(rst_n),
     .start(start),
@@ -46,31 +46,42 @@ module tb_llama_infer;
       $display("Missing +prompt_ids");
       $finish;
     end
+
     mem_path = {weights_dir, "/token_embd.mem"};
-    $readmemh(mem_path, dut.token_embd_fp16);
+    $readmemh(mem_path, dut.token_embd);
+    mem_path = {weights_dir, "/pos_embd.mem"};
+    $readmemh(mem_path, dut.pos_embd);
     mem_path = {weights_dir, "/output_weight.mem"};
-    $readmemh(mem_path, dut.out_weight_fp16);
+    $readmemh(mem_path, dut.out_weight);
     mem_path = {weights_dir, "/output_norm_weight.mem"};
-    $readmemh(mem_path, dut.out_norm_w_fp16);
+    $readmemh(mem_path, dut.out_norm_w);
+    mem_path = {weights_dir, "/output_norm_bias.mem"};
+    $readmemh(mem_path, dut.out_norm_b);
 
     mem_path = {weights_dir, "/attn_norm_weight.mem"};
-    $readmemh(mem_path, dut.attn_norm_w_fp16);
-    mem_path = {weights_dir, "/ffn_norm_weight.mem"};
-    $readmemh(mem_path, dut.ffn_norm_w_fp16);
-    mem_path = {weights_dir, "/attn_q_weight.mem"};
-    $readmemh(mem_path, dut.attn_q_w_fp16);
-    mem_path = {weights_dir, "/attn_k_weight.mem"};
-    $readmemh(mem_path, dut.attn_k_w_fp16);
-    mem_path = {weights_dir, "/attn_v_weight.mem"};
-    $readmemh(mem_path, dut.attn_v_w_fp16);
+    $readmemh(mem_path, dut.attn_norm_w);
+    mem_path = {weights_dir, "/attn_norm_bias.mem"};
+    $readmemh(mem_path, dut.attn_norm_b);
+    mem_path = {weights_dir, "/attn_qkv_weight.mem"};
+    $readmemh(mem_path, dut.qkv_w);
+    mem_path = {weights_dir, "/attn_qkv_bias.mem"};
+    $readmemh(mem_path, dut.qkv_b);
     mem_path = {weights_dir, "/attn_output_weight.mem"};
-    $readmemh(mem_path, dut.attn_out_w_fp16);
-    mem_path = {weights_dir, "/ffn_gate_weight.mem"};
-    $readmemh(mem_path, dut.ffn_gate_w_fp16);
+    $readmemh(mem_path, dut.attn_out_w);
+    mem_path = {weights_dir, "/attn_output_bias.mem"};
+    $readmemh(mem_path, dut.attn_out_b);
+    mem_path = {weights_dir, "/ffn_norm_weight.mem"};
+    $readmemh(mem_path, dut.ffn_norm_w);
+    mem_path = {weights_dir, "/ffn_norm_bias.mem"};
+    $readmemh(mem_path, dut.ffn_norm_b);
     mem_path = {weights_dir, "/ffn_up_weight.mem"};
-    $readmemh(mem_path, dut.ffn_up_w_fp16);
+    $readmemh(mem_path, dut.ffn_up_w);
+    mem_path = {weights_dir, "/ffn_up_bias.mem"};
+    $readmemh(mem_path, dut.ffn_up_b);
     mem_path = {weights_dir, "/ffn_down_weight.mem"};
-    $readmemh(mem_path, dut.ffn_dn_w_fp16);
+    $readmemh(mem_path, dut.ffn_dn_w);
+    mem_path = {weights_dir, "/ffn_down_bias.mem"};
+    $readmemh(mem_path, dut.ffn_dn_b);
 
     $readmemh(prompt_path, dut.input_tokens);
     if (!$value$plusargs("prompt_len=%d", prompt_len_arg)) begin

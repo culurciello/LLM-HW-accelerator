@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL_F16 = ROOT / "llm-models" / "SmolLM2-135M-Instruct-Q8_0.gguf"
+DEFAULT_MODEL_F16 = ROOT / "llm-models" / "SmolLM2-135M-Instruct-f16.gguf"
 DEFAULT_WEIGHTS_DIR = ROOT / "llm-models" / "weights_full"
 DEFAULT_PROMPT_FILE = ROOT / "tb" / "prompt_ids.mem"
 DEFAULT_PROMPT = "hello"
@@ -68,7 +68,7 @@ def eos_token_id(model_f16):
     return int(reader.fields["tokenizer.ggml.eos_token_id"].contents())
 
 
-def run_verilator(run_script, weights_dir, prompt_file, prompt_len, dump_topk=False, use_fp16=False):
+def run_verilator(run_script, weights_dir, prompt_file, prompt_len, dump_topk=False):
     print(f"[compare] run verilator: {run_script}")
     cmd = [
         str(run_script),
@@ -76,19 +76,29 @@ def run_verilator(run_script, weights_dir, prompt_file, prompt_len, dump_topk=Fa
         f"+prompt_ids={prompt_file}",
         f"+prompt_len={prompt_len}",
     ]
-    if use_fp16:
-        cmd.append("+use_fp16=1")
     if dump_topk:
         cmd.append("+dump_topk=1")
     out = run(cmd)
     topk = []
+    scores = []
     for line in out.splitlines():
         if line.startswith("NEXT_TOKEN_ID="):
             next_id = int(line.split("=")[1])
         elif line.startswith("TOPK["):
             parts = line.split()
             tid = int(parts[1].split("=")[1])
-            score = int(parts[2].split("=")[1])
+            score = None
+            for part in parts[2:]:
+                if part.startswith("score_fp16="):
+                    score = part.split("=")[1]
+                    try:
+                        score = int(score, 16)
+                    except ValueError:
+                        score = None
+                    break
+                if part.startswith("score_q=") or part.startswith("score="):
+                    score = int(part.split("=")[1])
+                    break
             topk.append((tid, score))
     if "next_id" not in locals():
         raise RuntimeError("Missing NEXT_TOKEN_ID from Verilator")
@@ -102,41 +112,13 @@ def _tensor_map(reader):
 
 def _tensor_data(tensor):
     ttype = getattr(tensor, "tensor_type", None)
-    if ttype == 8:
-        return _dequant_q8_0(tensor)
+    if ttype not in (None, 0, 1):
+        raise RuntimeError("Quantized GGUF tensors are not supported. Use the F16 model.")
     arr = np.array(tensor.data, dtype=np.float32)
     shape = list(getattr(tensor, "shape", []))
     if shape:
         arr = arr.reshape(shape)
     return arr
-
-
-def _dequant_q8_0(tensor):
-    data = np.asarray(tensor.data)
-    if data.dtype != np.uint8:
-        data = data.astype(np.uint8)
-    if data.ndim != 2:
-        raise RuntimeError("Q8_0 tensor data expected 2D byte array")
-    rows, row_bytes = data.shape
-    block_bytes = 34
-    if row_bytes % block_bytes != 0:
-        raise RuntimeError(f"Q8_0 row bytes {row_bytes} not divisible by {block_bytes}")
-    n_blocks = row_bytes // block_bytes
-    out = np.empty((rows, n_blocks * 32), dtype=np.float32)
-    for r in range(rows):
-        row = data[r].reshape(n_blocks, block_bytes)
-        scales = row[:, :2].copy().view("<f2").reshape(n_blocks).astype(np.float32)
-        qs = row[:, 2:].view(np.int8).astype(np.float32)
-        out[r] = (qs * scales[:, None]).reshape(-1)
-    shape = list(getattr(tensor, "shape", []))
-    if shape:
-        if out.shape == tuple(shape):
-            return out
-        if out.T.shape == tuple(shape):
-            return out.T
-        if out.size == int(np.prod(shape)):
-            return out.reshape(shape)
-    return out
 
 
 def _field_u32(reader, key, default=None):
@@ -465,7 +447,9 @@ def main():
     parser.add_argument("--weights-dir", default=str(DEFAULT_WEIGHTS_DIR))
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--prompt-file", default=str(DEFAULT_PROMPT_FILE))
-    parser.add_argument("--use-fp16", action="store_true", help="Use FP16 mems and SV path")
+    parser.add_argument("--out", default=None, help="Write a text report to this path")
+    parser.add_argument("--out-json", default=None, help="Write a JSON report to this path")
+    parser.add_argument("--gpt2-fp16", action="store_true", help="Use FP16 GPT-2 SV model")
     args = parser.parse_args()
 
     model_f16 = Path(args.model_f16)
@@ -473,7 +457,12 @@ def main():
     prompt_file = Path(args.prompt_file)
     prompt = args.prompt
 
-    print("[compare] start")
+    lines = []
+    def emit(text):
+        print(text)
+        lines.append(text)
+
+    emit("[compare] start")
     ensure_f16(model_f16)
     if not weights_dir.exists():
         raise RuntimeError(f"Missing weights dir: {weights_dir}")
@@ -487,7 +476,7 @@ def main():
         if arch is not None:
             arch_name = str(arch.contents())
     if arch_name == "llama":
-        print("[compare] architecture: llama")
+        emit("[compare] architecture: llama")
         py_result = run_python_reference_llama(model_f16, ids)
         sv_token, sv_topk = run_verilator(
             ROOT / "tb" / "run_llama_infer.sh",
@@ -495,39 +484,65 @@ def main():
             prompt_file,
             len(ids),
             dump_topk=True,
-            use_fp16=args.use_fp16,
         )
     else:
-        print("[compare] architecture: gpt2")
+        emit("[compare] architecture: gpt2")
         py_result = run_python_reference_gpt2(model_f16, ids)
+        run_script = ROOT / "tb" / ("run_gpt2_infer.sh" if args.gpt2_fp16 else "run_infer.sh")
         sv_token, sv_topk = run_verilator(
-            ROOT / "tb" / "run_infer.sh",
+            run_script,
             weights_dir,
             prompt_file,
             len(ids),
             dump_topk=True,
-            use_fp16=args.use_fp16,
         )
     llama_token, llama_text = run_llama_cli(model_f16, prompt)
 
-    print(f"prompt: {prompt}")
-    print(f"prompt_ids: {ids}")
+    emit(f"prompt: {prompt}")
+    emit(f"prompt_ids: {ids}")
     if py_result is not None:
         py_token, py_topk = py_result
-        print(f"python_next_token_id: {py_token}")
-        print(f"python_topk_ids: {py_topk}")
+        emit(f"python_next_token_id: {py_token}")
+        emit(f"python_topk_ids: {py_topk}")
         if vocab is not None:
-            print(f"python_topk_tokens: {_decode_ids(py_topk, vocab)}")
-    print(f"sv_next_token_id: {sv_token}")
+            emit(f"python_topk_tokens: {_decode_ids(py_topk, vocab)}")
+    emit(f"sv_next_token_id: {sv_token}")
     if sv_topk is not None:
-        print(f"sv_topk_ids: {sv_topk}")
+        emit(f"sv_topk_ids: {sv_topk}")
         if vocab is not None:
-            print(f"sv_topk_tokens: {_decode_ids(sv_topk, vocab)}")
-    print(f"llama_next_token_id: {llama_token}")
-    print(f"llama_next_token_text: {llama_text}")
-    print(f"sv_vs_llama: {'MATCH' if sv_token == llama_token else 'MISMATCH'}")
+            emit(f"sv_topk_tokens: {_decode_ids(sv_topk, vocab)}")
+    emit(f"llama_next_token_id: {llama_token}")
+    emit(f"llama_next_token_text: {llama_text}")
+    emit(f"sv_vs_llama: {'MATCH' if sv_token == llama_token else 'MISMATCH'}")
     if py_result is not None:
-        print(f"python_vs_llama: {'MATCH' if py_result[0] == llama_token else 'MISMATCH'}")
+        emit(f"python_vs_llama: {'MATCH' if py_result[0] == llama_token else 'MISMATCH'}")
+
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text("\n".join(lines) + "\n", encoding="ascii")
+
+    if args.out_json:
+        import json
+
+        report = {
+            "model": str(model_f16),
+            "weights_dir": str(weights_dir),
+            "prompt": prompt,
+            "prompt_ids": ids,
+            "arch": arch_name,
+            "python_next_token_id": py_result[0] if py_result is not None else None,
+            "python_topk_ids": py_result[1] if py_result is not None else None,
+            "sv_next_token_id": sv_token,
+            "sv_topk_ids": sv_topk,
+            "llama_next_token_id": llama_token,
+            "llama_next_token_text": llama_text,
+            "sv_vs_llama": sv_token == llama_token,
+            "python_vs_llama": (py_result[0] == llama_token) if py_result is not None else None,
+        }
+        out_json_path = Path(args.out_json)
+        out_json_path.parent.mkdir(parents=True, exist_ok=True)
+        out_json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="ascii")
 
 
 if __name__ == "__main__":

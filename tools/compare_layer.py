@@ -10,7 +10,9 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-FRAC_W = 8
+DEFAULT_MODEL = ROOT / "llm-models" / "SmolLM2-135M-Instruct-f16.gguf"
+DEFAULT_WEIGHTS_DIR = ROOT / "llm-models" / "weights_full"
+DEFAULT_PROMPT_MEM = ROOT / "tb" / "prompt_ids.mem"
 
 try:
     import gguf
@@ -49,21 +51,14 @@ def tokenize(model_path, text):
     return ast.literal_eval(out)
 
 
-def parse_mem(path, fp16=False):
+def parse_mem(path):
     data = []
     with path.open("r", encoding="ascii") as f:
         for line in f:
             val = int(line.strip(), 16)
-            if fp16:
-                data.append(val & 0xFFFF)
-            else:
-                if val & 0x8000:
-                    val -= 0x10000
-                data.append(val)
-    arr = np.array(data, dtype=np.uint16 if fp16 else np.int16)
-    if fp16:
-        return arr.view(np.float16).astype(np.float32)
-    return arr.astype(np.float32) / (1 << FRAC_W)
+            data.append(val & 0xFFFF)
+    arr = np.array(data, dtype=np.uint16)
+    return arr.view(np.float16).astype(np.float32)
 
 
 def write_ref(path, arr):
@@ -72,54 +67,40 @@ def write_ref(path, arr):
             f.write(f"{v:.6f}\n")
 
 
+def write_prompt_mem(path, ids):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="ascii") as f:
+        for tid in ids:
+            f.write(f"{tid:08x}\n")
+
+
+def run_sv_dump(run_script, weights_dir, prompt_mem, prompt_len, dump_dir, layer, dump_all, dump_pos):
+    cmd = [
+        str(run_script),
+        f"+weights_dir={weights_dir}",
+        f"+prompt_ids={prompt_mem}",
+        f"+prompt_len={prompt_len}",
+        f"+dump_dir={dump_dir}",
+        f"+dump_layer={layer}",
+        f"+dump_all={1 if dump_all else 0}",
+        f"+dump_pos={dump_pos}",
+    ]
+    run(cmd)
+
+
 def _tensor_map(reader):
     return {getattr(t, "name", None): t for t in reader.tensors}
 
 
 def _tensor_data(tensor):
     ttype = getattr(tensor, "tensor_type", None)
-    if ttype == 8:
-        return _dequant_q8_0(tensor)
+    if ttype not in (None, 0, 1):
+        raise RuntimeError("Quantized GGUF tensors are not supported. Use the F16 model.")
     arr = np.array(tensor.data, dtype=np.float32)
     shape = list(getattr(tensor, "shape", []))
     if shape:
         arr = arr.reshape(shape)
     return arr
-
-
-def _dequant_q8_0(tensor):
-    data = np.asarray(tensor.data)
-    if data.dtype != np.uint8:
-        data = data.astype(np.uint8)
-    if data.ndim != 2:
-        raise RuntimeError("Q8_0 tensor data expected 2D byte array")
-    rows, row_bytes = data.shape
-    block_bytes = 34
-    if row_bytes % block_bytes != 0:
-        raise RuntimeError(f"Q8_0 row bytes {row_bytes} not divisible by {block_bytes}")
-    n_blocks = row_bytes // block_bytes
-    out = np.empty((rows, n_blocks * 32), dtype=np.float32)
-    for r in range(rows):
-        row = data[r].reshape(n_blocks, block_bytes)
-        scales = row[:, :2].copy().view("<f2").reshape(n_blocks).astype(np.float32)
-        qs = row[:, 2:].view(np.int8).astype(np.float32)
-        out[r] = (qs * scales[:, None]).reshape(-1)
-    shape = list(getattr(tensor, "shape", []))
-    if shape:
-        if out.shape == tuple(shape):
-            return out
-        if out.T.shape == tuple(shape):
-            return out.T
-        if out.size == int(np.prod(shape)):
-            return out.reshape(shape)
-    return out
-
-
-def quantize_q8_8(arr):
-    scale = 1 << FRAC_W
-    q = np.round(arr * scale).astype(np.int32)
-    q = np.clip(q, -32768, 32767).astype(np.int16)
-    return q.astype(np.float32) / scale
 
 
 def _field_u32(reader, key, default=None):
@@ -289,28 +270,20 @@ def llama_layer_dump(model_path, prompt_ids, target_layer, dump_all, dump_pos):
 
 def main():
     parser = argparse.ArgumentParser(description="Compare SV layer dumps to Python reference.")
-    parser.add_argument("--model", required=True, help="Path to F16 GGUF model")
+    parser.add_argument("--model", default=str(DEFAULT_MODEL), help="Path to F16 GGUF model")
     parser.add_argument("--prompt", required=True, help="Prompt text")
     parser.add_argument("--layer", type=int, default=0, help="Layer index to dump")
     parser.add_argument("--dump-all", action="store_true", help="Dump all layers")
     parser.add_argument("--pos", type=int, default=-1, help="Token position (default: last)")
     parser.add_argument("--sv-dir", default=None, help="Path to SV dump dir (optional)")
+    parser.add_argument("--run-sv", action="store_true", help="Run SV to generate dumps before comparison")
+    parser.add_argument("--weights-dir", default=str(DEFAULT_WEIGHTS_DIR), help="Weights directory for SV run")
+    parser.add_argument("--run-script", default=str(ROOT / "tb" / "run_llama_infer.sh"))
+    parser.add_argument("--prompt-mem", default=str(DEFAULT_PROMPT_MEM))
     parser.add_argument("--ref-dir", default=str(ROOT / "tb" / "dump_ref"))
     parser.add_argument("--head", type=int, default=8, help="Print first N entries on mismatch")
-    parser.add_argument("--sv-fp16", action="store_true", help="SV dumps are FP16 mems")
-    parser.add_argument("--fp16", action="store_true", help="Quantize Python reference to FP16 before compare")
-    parser.add_argument(
-        "--quantize-ref",
-        action="store_true",
-        default=True,
-        help="Quantize Python reference to Q8.8 before comparison (default: on)",
-    )
-    parser.add_argument(
-        "--no-quantize-ref",
-        dest="quantize_ref",
-        action="store_false",
-        help="Disable Q8.8 quantization of Python reference",
-    )
+    parser.add_argument("--out", default=None, help="Write a text report to this path")
+    parser.add_argument("--out-json", default=None, help="Write a JSON report to this path")
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -335,40 +308,92 @@ def main():
     for tag, arr in dumps.items():
         write_ref(ref_dir / f"layer{args.layer}_{tag}.txt", arr)
 
-    if args.sv_dir is None:
+    sv_dir = Path(args.sv_dir) if args.sv_dir is not None else None
+    if args.run_sv:
+        if sv_dir is None:
+            sv_dir = ROOT / "tb" / "dump_sv"
+        write_prompt_mem(Path(args.prompt_mem), ids)
+        run_sv_dump(
+            Path(args.run_script),
+            Path(args.weights_dir),
+            Path(args.prompt_mem),
+            len(ids),
+            sv_dir,
+            args.layer,
+            args.dump_all,
+            dump_pos,
+        )
+
+    if sv_dir is None:
         print(f"Wrote reference dumps to {ref_dir}")
         return
 
-    sv_dir = Path(args.sv_dir)
     if not sv_dir.exists():
         raise RuntimeError(f"Missing SV dump dir: {sv_dir}")
 
-    if args.fp16:
-        print("using FP16 reference for comparison")
-    elif args.quantize_ref:
-        print("using quantized Q8.8 reference for comparison")
-    print("tag len max_abs mean_abs ref_min ref_max sv_min sv_max")
+    lines = []
+    def emit(text):
+        print(text)
+        lines.append(text)
+
+    emit("using FP16 reference for comparison")
+    emit("Note: ref = SW, SV = system Verilog, HW:")
+    emit("tag len max_abs mean_abs ref_min ref_max sv_min sv_max")
+    rows = []
     for tag, ref in dumps.items():
         sv_path = sv_dir / f"layer{args.layer}_{tag}.mem"
         if not sv_path.exists():
             continue
-        sv = parse_mem(sv_path, fp16=args.sv_fp16)
+        sv = parse_mem(sv_path)
         if sv.shape[0] != ref.shape[0]:
-            print(f"{tag} size_mismatch {sv.shape[0]} vs {ref.shape[0]}")
+            emit(f"{tag} size_mismatch {sv.shape[0]} vs {ref.shape[0]}")
             continue
-        if args.fp16:
-            ref_cmp = ref.astype(np.float16).astype(np.float32)
-        else:
-            ref_cmp = quantize_q8_8(ref) if args.quantize_ref else ref
+        ref_cmp = ref.astype(np.float16).astype(np.float32)
         diff = np.abs(ref_cmp - sv)
-        print(
+        row = {
+            "tag": tag,
+            "len": int(ref.shape[0]),
+            "max_abs": float(diff.max()),
+            "mean_abs": float(diff.mean()),
+            "ref_min": float(ref_cmp.min()),
+            "ref_max": float(ref_cmp.max()),
+            "sv_min": float(sv.min()),
+            "sv_max": float(sv.max()),
+        }
+        emit(
             f"{tag} {ref.shape[0]} {diff.max():.6f} {diff.mean():.6f} "
             f"{ref_cmp.min():.6f} {ref_cmp.max():.6f} {sv.min():.6f} {sv.max():.6f}"
         )
         if diff.max() > 1.0 and args.head > 0:
             head = args.head
-            print(f"{tag} ref_head {ref_cmp[:head].tolist()}")
-            print(f"{tag} sv_head  {sv[:head].tolist()}")
+            ref_head = ref_cmp[:head].tolist()
+            sv_head = sv[:head].tolist()
+            emit(f"{tag} ref_head {ref_head}")
+            emit(f"{tag} sv_head  {sv_head}")
+            row["ref_head"] = ref_head
+            row["sv_head"] = sv_head
+        rows.append(row)
+
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text("\n".join(lines) + "\n", encoding="ascii")
+
+    if args.out_json:
+        import json
+
+        report = {
+            "model": str(model_path),
+            "prompt": args.prompt,
+            "prompt_ids": ids,
+            "layer": args.layer,
+            "pos": dump_pos,
+            "sv_dir": str(sv_dir),
+            "rows": rows,
+        }
+        out_json_path = Path(args.out_json)
+        out_json_path.parent.mkdir(parents=True, exist_ok=True)
+        out_json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="ascii")
 
 
 if __name__ == "__main__":
