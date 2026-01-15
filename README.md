@@ -3,6 +3,14 @@
 A freakishly fun LLM accelerator in system verilog to run an entire LLM on your nice FPGA!!!
 
 
+## Project Status
+
+| Test | Status |
+| --- | --- |
+| minGPT adder test | OK |
+| SmolLM2-135M-Instruct-f16 test | TBD ?? |
+| tinystories-gpt-0.1-3m.fp16 test | output YES but hard to compare to SW |
+
 
 ## Install
 
@@ -72,6 +80,17 @@ Memory Map (word addressed)
   - `./tb/run_llama_infer.sh +weights_dir=llm-models/weights_smol +prompt_ids=tb/prompt_ids.mem +prompt_len=1`
 - The LLaMA model uses RMSNorm + RoPE + GQA and expects the LLaMA-style `.mem` files.
 
+### Adder (minGPT) Export and SV Inference
+Train a model from https://github.com/karpathy/minGPT: ```$ python3 projects/adder/adder.py ```.
+Then:
+- Export the minGPT checkpoint to SV mem files:
+  - `python3 tools/mingpt_export_sv.py --checkpoint llm-models/adder/model.pt --config llm-models/adder/config.json --out llm-models/adder/weights_sv`
+- Create a prompt (digits only, one hex ID per line). Example for 85 + 50 (prompt digits `8 5 5 0`):
+  - `printf "00000008\n00000005\n00000005\n00000000\n" > tb/prompt_ids.mem`
+- Run the SV model (one next token per run):
+  - `./tb/run_adder_infer.sh +weights_dir=llm-models/adder/weights_sv +prompt_ids=tb/prompt_ids.mem +prompt_len=4`
+- Repeat with the new token appended to build the full (n+1)-digit sum.
+
 ### Chat With the HDL Model (Verilator)
 - Single prompt:
   - `python3 tools/chat.py --prompt "1+1=?" --steps 30 --model llm-models/SmolLM2-135M-Instruct-f16.gguf`
@@ -111,6 +130,10 @@ Memory Map (word addressed)
 ### TinyStories Generation Test
 - Run the TinyStories GPT model with the recommended sampling config and template:
   - `python3 tools/tinystories_generate.py --model llm-models/tinystories-gpt-0.1-3m.fp16.gguf`
+- SW reference generation (generic):
+  - `python3 tools/generate_sw.py --model llm-models/tinystories-gpt-0.1-3m.fp16.gguf --prompt "<|start_story|>Once upon a time, " --n-predict 200`
+- SV/HW generation (generic):
+  - `python3 tools/generate_sv.py --model llm-models/tinystories-gpt-0.1-3m.fp16.gguf --weights-dir llm-models/weights_tinystories_fp16 --prompt "<|start_story|>Once upon a time, " --steps 200 --gpt2-fp16`
 
 #### What the compare does
 - Tokenizes “hello” with `llama-tokenize` to get prompt token IDs.
