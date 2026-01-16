@@ -2,6 +2,8 @@
 
 A freakishly fun LLM accelerator in system verilog to run an entire LLM on your nice FPGA!!!
 
+![](docs/cover.png)
+
 
 ## Project Status
 
@@ -10,6 +12,26 @@ A freakishly fun LLM accelerator in system verilog to run an entire LLM on your 
 | minGPT adder test | OK |
 | SmolLM2-135M-Instruct-f16 test | TBD ?? |
 | tinystories-gpt-0.1-3m.fp16 test | output YES but hard to compare to SW |
+
+
+minGPT adder
+
+```
+$ python3 tools/compare_adder_sv_sw.py --prompt "3+4=
+"
+number of parameters: 0.09M
+prompt: '3+4=\n'
+ndigit: 2
+inputs: 3 + 4
+prompt_digits: [0, 3, 0, 4]
+sv_out_digits_reversed: [7, 0, 0]
+sw_out_digits_reversed: [7, 0, 0]
+sv_out_digits_normal: [0, 0, 7]
+sw_out_digits_normal: [0, 0, 7]
+sv_sum: 7
+sw_sum: 7
+sv_vs_sw: MATCH
+```
 
 
 ## Install
@@ -167,11 +189,8 @@ Then:
 
 ## Models
 
+- https://www.reddit.com/r/LocalLLaMA/comments/1gnws1h/smallest_llamacpp_model/
 
-https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF 
+- https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF
 
-TinyStories:
-
-https://www.reddit.com/r/LocalLLaMA/comments/1gnws1h/smallest_llamacpp_model/
-
-https://huggingface.co/afrideva/Tinystories-gpt-0.1-3m-GGUF/tree/main
+- https://huggingface.co/afrideva/Tinystories-gpt-0.1-3m-GGUF/tree/main
