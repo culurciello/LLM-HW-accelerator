@@ -44,6 +44,27 @@ Memory Map (word addressed)
 ### Run the Testbench
 - ./tb/run_verilator.sh
 
+
+## get models
+
+Load GGUF Weights (SmolLM2 Or TinyStories)
+
+Place the models in llm-models/:
+`llm-models/SmolLM2-135M-Instruct-f16.gguf`
+`llm-models/tinystories-gpt-0.1-3m.fp16.gguf`
+
+Or download them with:
+`./llm-models/download-model.sh`
+
+Convert weights to mem files (requires gguf or llama-cpp-python Python package):
+
+TinyStories GPT model:
+`python3 tools/gguf_export_full.py --model llm-models/tinystories-gpt-0.1-3m.fp16.gguf --out llm-models/weights_tinystories_fp16`
+
+SmolLM2 model:
+`python3 tools/gguf_export_full.py --model llm-models/SmolLM2-135M-Instruct-f16.gguf --out llm-models/weights_smol`
+
+
 ## Models and Usage
 
 Models live under `llm-models/<name>/`. Use the unified runner to list or select them:
